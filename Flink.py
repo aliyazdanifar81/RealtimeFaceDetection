@@ -15,7 +15,7 @@ class FaceDetectionMapFunction(MapFunction):
         self.cap = None
         self.face_detection_model = None
         self.face_recognition_model = None
-        self.trackers = []  # List to store active trackers
+        self.trackers = []  # stores dicts: {'tracker': tracker, 'tag': tag}
         self.frame_counter = 0
 
     def open(self, runtime_context: RuntimeContext):
@@ -40,42 +40,49 @@ class FaceDetectionMapFunction(MapFunction):
 
             # Run face detection every `detection_interval` frames
             if self.frame_counter % self.detection_interval == 0:
-                # Clear existing trackers
-                self.trackers = []
-                # Detect faces
+                self.trackers = []  # Reset trackers
                 faces = face_detector(frame, self.face_detection_model)
-                # Initialize trackers for detected faces
+                embeddings = []
+                valid_faces = []
                 for (x, y, w, h) in faces:
-                    tracker = cv2.TrackerKCF_create()  # Choose a tracker
-                    bbox = (x, y, w, h)
-                    tracker.init(frame, bbox)
-                    self.trackers.append(tracker)
+                    cropped_face = frame[y:y + h, x:x + w]
+                    if cropped_face.size == 0:
+                        continue
+                    embedding = np.array(face_embedding(cropped_face, self.face_recognition_model)[1])
+                    embeddings.append(embedding.flatten().tolist())
+                    valid_faces.append((x, y, w, h))
+
+                # Batch search embeddings
+                tags = self.milvus_db.batch_search(embeddings, threshold=0.3)
+                new_embeddings = []
+                new_tags = []
+                for i, tag in enumerate(tags):
+                    if tag is None:
+                        new_tag = self.milvus_db.assign_new_tag()
+                        new_embeddings.append(embeddings[i])
+                        new_tags.append(new_tag)
+                        tags[i] = new_tag
+                # Batch insert new faces
+                if new_embeddings:
+                    self.milvus_db.batch_insert(new_embeddings, new_tags)
+
+                # Initialize trackers with tags
+                for (x, y, w, h), tag in zip(valid_faces, tags):
+                    tracker = cv2.TrackerKCF_create()
+                    tracker.init(frame, (x, y, w, h))
+                    self.trackers.append({'tracker': tracker, 'tag': tag})
 
             # Update trackers for existing faces
             updated_faces = []
-            for tracker in self.trackers:
+            for tracker_info in self.trackers:
+                tracker = tracker_info['tracker']
                 success, bbox = tracker.update(frame)
                 if success:
-                    updated_faces.append(bbox)  # Add the updated bounding box
+                    x, y, w, h = map(int, bbox)
+                    updated_faces.append((x, y, w, h, tracker_info['tag']))
 
-            # Process each detected face
-            for (x, y, w, h) in updated_faces:
-                # Crop the face
-                cropped_face = frame[y:y + h, x:x + w]
-                if cropped_face.size == 0:
-                    continue  # Skip empty crops
-
-                # Compute face embedding
-                embedding = np.array(face_embedding(cropped_face, self.face_recognition_model)[1]).flatten().tolist()
-
-                # Search for the face in Milvus
-                tag = self.milvus_db.search_face(embedding, threshold=0.3)
-                if tag is None:
-                    # Assign a new tag and insert into Milvus
-                    tag = self.milvus_db.assign_new_tag()
-                    self.milvus_db.insert_face(embedding, tag)
-
-                # Draw bounding box and tag
+            # Draw using stored tags
+            for (x, y, w, h, tag) in updated_faces:
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.putText(frame, tag, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
